@@ -164,13 +164,16 @@ export default function CaseDetailPage() {
 
   /* ── On mount: load case info, then decide based on mode ── */
   useEffect(() => {
+    let stale = false; // prevents state updates if studentId changes mid-flight
     async function init() {
       setLoadingCase(true);
       setCaseError(null);
       try {
         const data = await getCaseStatus(studentId);
+        if (stale) return;
         setCaseInfo(data);
       } catch (err) {
+        if (stale) return;
         setCaseError(err?.response?.data?.detail || err.message || 'Failed to load case.');
         setLoadingCase(false);
         return;
@@ -183,6 +186,7 @@ export default function CaseDetailPage() {
         if (cached) {
           try {
             const { screeningResult: sr, finalResult: fr, elapsedTime: et } = JSON.parse(cached);
+            if (stale) return;
             if (sr) {
               setScreeningResult(sr);
               await loadJobAudit(sr.thread_id);
@@ -207,6 +211,9 @@ export default function CaseDetailPage() {
       setScreeningStartTime(startTime);
       try {
         const result = await triggerScreening(studentId);
+        if (stale) return;
+        // Double-check the returned result belongs to this student
+        if (result.student_id && result.student_id !== studentId) return;
         const elapsed = Math.round((Date.now() - startTime) / 1000);
         const formatted = result.execution_time ||
           (elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed/60)}m ${elapsed%60}s`);
@@ -215,12 +222,14 @@ export default function CaseDetailPage() {
         await loadJobAudit(result.thread_id);
         sessionStorage.setItem(`screening_${studentId}`, JSON.stringify({ screeningResult: result, finalResult: null, elapsedTime: formatted }));
       } catch (err) {
+        if (stale) return;
         setScreeningError(err?.response?.data?.detail || err.message || 'Screening failed.');
       } finally {
-        setScreeningLoading(false);
+        if (!stale) setScreeningLoading(false);
       }
     }
     init();
+    return () => { stale = true; };
   }, [studentId, mode]);
 
   /* ── Re-run screening (clears cache and re-triggers) ── */

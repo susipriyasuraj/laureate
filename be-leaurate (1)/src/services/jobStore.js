@@ -8,19 +8,34 @@ const __dirname = path.dirname(__filename);
 
 const filePath = path.join(__dirname, "../data/jobs.json");
 
+// In-memory cache to prevent stale-read race conditions when multiple
+// async operations (trigger flow, statusSync, inbox) read/modify/write
+// the same file concurrently within the same Node process.
+let _jobsCache = null;
+
 /**
- * Read jobs from file
+ * Read jobs from file (uses in-memory cache after first load)
  */
 const readJobs = () => {
+  if (_jobsCache) return _jobsCache;
   const data = fs.readFileSync(filePath, "utf-8");
-  return JSON.parse(data || "[]");
+  _jobsCache = JSON.parse(data || "[]");
+  return _jobsCache;
 };
 
 /**
- * Write jobs to file
+ * Write jobs to file (and update in-memory cache)
  */
 const writeJobs = (jobs) => {
+  _jobsCache = jobs;
   fs.writeFileSync(filePath, JSON.stringify(jobs, null, 2));
+};
+
+/**
+ * Invalidate in-memory cache (used after external file reset)
+ */
+export const invalidateJobsCache = () => {
+  _jobsCache = null;
 };
 
 /**
@@ -72,7 +87,11 @@ export const updateJobResult = (jobId, result) => {
   let job = jobs.findIndex((job) => job.jobId === jobId);
 
   if (job === -1) {
-    throw new Error(`Job with jobId ${jobId} not found`);
+    // Upsert: create the entry if it doesn't exist (guards against race conditions)
+    const newJob = { jobId, ...result };
+    jobs.push(newJob);
+    writeJobs(jobs);
+    return newJob;
   }
 
   jobs[job] = {...jobs[job], ...result};

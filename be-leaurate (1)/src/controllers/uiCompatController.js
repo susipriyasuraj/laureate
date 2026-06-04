@@ -1,3 +1,6 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 import fs from "node:fs";
 import path from "node:path";
 import axios from "axios";
@@ -7,6 +10,7 @@ import {
   createJob,
   getAllJobs,
   updateJobResult,
+  invalidateJobsCache,
 } from "../services/jobStore.js";
 import {
   executeJob,
@@ -25,6 +29,80 @@ const __dirname = path.dirname(__filename);
 const jobsFilePath = path.join(__dirname, "../data/jobs.json");
 const excelFilePath = path.join(__dirname, "../data/Applicant_Case_Tracker.xlsx");
 const activeScreeningByStudent = new Map();
+
+/* ── Azure OpenAI helper for descriptive flag one-liners ── */
+const azureOpenAiClient = (() => {
+  const key = process.env.AZURE_OPENAI_API_KEY;
+  const endpoint = (process.env.AZURE_OPENAI_ENDPOINT || "").replace(/\/+$/, "");
+  const deployment = process.env.AZURE_OPENAI_DEPLOYMENT_NAME || "gpt-4o-mini";
+  const apiVersion = process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview";
+  if (!key || !endpoint) return null;
+  const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
+  return { url, key };
+})();
+
+/**
+ * Call Azure OpenAI to turn terse flag values ("Present", "Missing", result text)
+ * into short, human-readable one-liner descriptions.
+ * Input: { "ID and Personal Details": "Missing", "Gradesheets": "Present", ... }
+ * Output: { "ID and Personal Details": "No identity ...", ... }
+ */
+const generateFlagDescriptions = async (flagMap) => {
+  if (!azureOpenAiClient || !flagMap || Object.keys(flagMap).length === 0) {
+    return flagMap; // pass-through when LLM is not configured
+  }
+
+  const entries = Object.entries(flagMap);
+  const flagList = entries
+    .map(([name, value]) => `- ${name}: ${value}`)
+    .join("\n");
+
+  try {
+    const res = await axios.post(
+      azureOpenAiClient.url,
+      {
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an assistant that rewrites short document-check results into brief, professional one-liner descriptions (max 15 words each). " +
+              "Keep the same pass/fail meaning. Do NOT add any extra commentary. " +
+              "Return ONLY a valid JSON object mapping each check name to its one-liner description. No markdown fences.",
+          },
+          {
+            role: "user",
+            content: `Rewrite each of these screening check results into a short descriptive sentence:\n${flagList}`,
+          },
+        ],
+        temperature: 0.3,
+        max_tokens: 400,
+      },
+      {
+        headers: {
+          "api-key": azureOpenAiClient.key,
+          "Content-Type": "application/json",
+        },
+        timeout: 15000,
+      }
+    );
+
+    const content = res.data?.choices?.[0]?.message?.content || "";
+    // Strip markdown fences if present
+    const cleaned = content.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    // Merge: LLM description replaces terse value, keep original if LLM missed a key
+    const result = {};
+    for (const [name, original] of entries) {
+      result[name] = typeof parsed[name] === "string" && parsed[name].trim()
+        ? parsed[name].trim()
+        : original;
+    }
+    return result;
+  } catch (err) {
+    // LLM call failed — fall back to original terse values
+    return flagMap;
+  }
+};
 
 const WORKFLOW_FILE_INPUT_ALIASES = [
   "crm_input_file",
@@ -291,6 +369,73 @@ const parseList = (value) => {
   return [String(value)];
 };
 
+/**
+ * Check whether a value should be treated as blank / absent.
+ */
+const isBlank = (v) =>
+  v === null ||
+  v === undefined ||
+  String(v).trim() === "" ||
+  v === "null" ||
+  v === "undefined";
+
+/**
+ * Return the first non-blank value found in `obj` for the given keys.
+ */
+const firstNonBlank = (obj, ...keys) => {
+  for (const key of keys) {
+    if (!isBlank(obj[key])) return obj[key];
+  }
+  return null;
+};
+
+/**
+ * Merge new-case and update-case Opus workflow outputs into a single
+ * normalised object.  For every field the new-case value is preferred;
+ * the update-case value is used only when the new-case value is blank.
+ * Only non-null entries are included in the returned object.
+ */
+const mergeWorkflowOutputs = (raw) => {
+  if (!raw || typeof raw !== "object") return {};
+
+  const fieldMappings = [
+    // [normalised key,            new-case keys (space + underscore),        update-case key]
+    ["final_decision",             ["decision"],                                                    "decision_up"],
+    ["case_status",                ["Case Status", "case_status"],                                  "case_status_up"],
+    ["application_status",         ["application_status"],                                          "application_status_up"],
+    ["flagged_or_verified",        ["flagged/verified", "flagged_or_verified"],                     "flagged_verified_up"],
+    ["final_reason",               ["decision of agent", "final_reason", "screening_decision"],     "final_reason_up"],
+    ["final_deficiency_list",      ["final deficiency list", "final_deficiency_list"],              "final_deficiency_list_up"],
+    ["flagged_or_verified_agent",  ["flagged/verified(agent's output)", "flagged_or_verified_agent"], "flagged_verified_agent_up"],
+    ["case_status_agent",          ["case_status(agent)", "case_status_agent"],                    "case_status_agent_up"],
+    ["id_proof_check",             ["id proof and personal details check", "id_proof_check"],      "id_proof_check_up"],
+    ["signature_check",            ["signature check", "signature_check"],                         "signature_check_up"],
+    ["grade_sheets_check",         ["grade sheets check", "grade_sheets_check"],                   "grade_sheets_check_up"],
+    ["lor_check",                  ["lor check", "lor_check"],                                     "lor_check_up"],
+    ["work_experience_check",      ["work experience check", "work_experience_check"],             "work_experience_check_up"],
+    ["candidate_full_name",        ["Candidate Full Name", "candidate_full_name"],                 "candidate_full_name_up"],
+    ["work_experience_flag",       ["work experience flag", "work_experience_flag"],               "work_experience_flag_up"],
+    ["gpa_flag",                   ["gpa flag", "gpa_flag"],                                       "gpa_flag_up"],
+    ["lor_date_flag",              ["lor date flag", "lor_date_flag"],                             "lor_date_flag_up"],
+    ["lor_university_flag",        ["lor university flag", "lor_university_flag"],                 "lor_university_flag_up"],
+    ["gpa_result",                 ["gpa result", "gpa_result"],                                   "gpa_result_up"],
+    ["work_experience_result",     ["work experience result", "work_experience_result"],           "work_experience_result_up"],
+    ["lor_date_result",            ["lor date result", "lor_date_result"],                         "lor_date_result_up"],
+    ["lor_university_result",      ["lor university result", "lor_university_result"],             "lor_university_result_up"],
+  ];
+
+  const merged = {};
+  for (const [outputKey, newKeys, updateKey] of fieldMappings) {
+    const value = firstNonBlank(raw, ...newKeys, updateKey);
+    if (value !== null) {
+      // Prefix with 'merged_' so workflow outputs never overwrite original job metadata
+      merged[`merged_${outputKey}`] = value;
+    }
+  }
+
+  return merged;
+};
+
 const isPassSignal = (value = "") => {
   const v = String(value).toLowerCase();
   return (
@@ -359,6 +504,7 @@ const toCompletenessFlagObj = (detailText, checkValue) => {
 
 const resolveCaseStatus = (job = {}) => {
   return (
+    job.merged_case_status ||
     job.case_status ||
     job.workflow_output_k47bmhmub ||
     job.workflow_output_010zbd01n ||
@@ -368,6 +514,8 @@ const resolveCaseStatus = (job = {}) => {
 
 const resolveDecision = (job = {}) => {
   return (
+    job.merged_final_decision ||
+    job.final_decision ||
     job.decision ||
     job.application_status ||
     job.workflow_output_d8mdr6bal ||
@@ -383,7 +531,8 @@ const resolveDecision = (job = {}) => {
 };
 
 const resolveApplicantName = (job = {}) => {
-  return job.workflow_output_dtnvounmw || job.applicant_name || "Unknown Applicant";
+  // Excel applicant_name is the ground truth; never let workflow output override it
+  return job.applicant_name || job.merged_candidate_full_name || job.candidate_full_name || job.workflow_output_dtnvounmw || "Unknown Applicant";
 };
 
 const resolveAttachmentLabel = (job = {}) => {
@@ -556,60 +705,133 @@ const formatExecutionTime = (startMs, endMs) => {
   return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 };
 
-const toScreeningResult = (job) => {
+const toScreeningResult = async (job) => {
+  const merged = mergeWorkflowOutputs(job);
+
   const deficiencyList = parseList(
+    merged.merged_final_deficiency_list ||
     job.workflow_output_4nsq04hnq || job.workflow_output_0zvjoraqj ||
     job.workflow_output_4mxgvc0db || job.workflow_output_qbme87hzy ||
     job.workflow_output_w2xij3alp
   );
 
+  // Build raw completeness flags (terse values)
+  const rawCompleteness = {
+    "ID and Personal Details":
+      merged.merged_id_proof_check || job.id_proof_check || job["id proof and personal details check"] || job.workflow_output_s3t4r9a5d || job.workflow_output_4f6zv6ezv || job.workflow_output_9sd0a6s0c || null,
+    "Signature Check":
+      merged.merged_signature_check || job.signature_check || job["signature check"] || job.signature_check_result || null,
+    "Gradesheets and Certificates":
+      merged.merged_grade_sheets_check || job.grade_sheets_check || job["grade sheets check"] || job.workflow_output_pook82hn8 || job.workflow_output_hqo6skenu || null,
+    "LOR Documents":
+      merged.merged_lor_check || job.lor_check || job["lor check"] || job.workflow_output_9eyscad0a || job.workflow_output_wppc352e4 || null,
+    "Work Experience Documents":
+      merged.merged_work_experience_check || job.work_experience_check || job["work experience check"] || job.workflow_output_r6ieynkdw || job.workflow_output_ohi0ujbcx || null,
+  };
+
+  // Build raw screening flags (result text — descriptive sentences from Opus)
+  const rawScreening = {
+    "GPA Result":
+      merged.merged_gpa_result || job.gpa_result || job["gpa result"] ||
+      job.workflow_output_pja74pfth || job.workflow_output_7gomgutht ||
+      job.workflow_output_cd4rwg8jc || job.workflow_output_0grmdqhhh || job.workflow_output_023wrk0az || null,
+    "Work Experience Result":
+      merged.merged_work_experience_result || job.work_experience_result || job["work experience result"] ||
+      job.workflow_output_41odl25kg || job.workflow_output_ss5t3ejb2 ||
+      job.workflow_output_ga0k4n971 || job.workflow_output_ye44rvws7 || job.workflow_output_z9kai3q6o || null,
+    "LOR University Result":
+      merged.merged_lor_university_result || job.lor_university_result || job["lor university result"] ||
+      job.workflow_output_p1eiiron5 || job.workflow_output_a7ws4bkvh ||
+      job.workflow_output_lw6wqc2qi || job.workflow_output_yk6si123w || job.workflow_output_cvrqcxwzu || null,
+    "LOR Date Result":
+      merged.merged_lor_date_result || job.lor_date_result || job["lor date result"] ||
+      job.workflow_output_c1yfb833k || job.workflow_output_helgagikd ||
+      job.workflow_output_05bbe8fsy || job.workflow_output_fvnjvkgal || job.workflow_output_pexqqlsbt || null,
+  };
+
+  // Screening flag colors (Green/Red/Skipped)
+  const rawScreeningFlags = {
+    "GPA Result":
+      merged.merged_gpa_flag || job.gpa_flag || job["gpa flag"] ||
+      job.workflow_output_zoi9kbovp || job.workflow_output_19ta2ozzp || job.workflow_output_nvaqzt98o ||
+      job.workflow_output_f5gjak4tz || job.workflow_output_86j1k78bn || job.gpa_screening || null,
+    "Work Experience Result":
+      merged.merged_work_experience_flag || job.work_experience_flag || job["work experience flag"] ||
+      job.workflow_output_xxtwwawgq || job.workflow_output_d7w6lmvd4 ||
+      job.workflow_output_5zqm4lvlm || job.workflow_output_l0stk8r0x || job.work_exp_screening || null,
+    "LOR University Result":
+      merged.merged_lor_university_flag || job.lor_university_flag || job["lor university flag"] ||
+      job.workflow_output_5ixpqswvn || job.workflow_output_abnldakui ||
+      job.workflow_output_6tl5iyh7f || job.workflow_output_h9gink23g || job.lor_university_screening || null,
+    "LOR Date Result":
+      merged.merged_lor_date_flag || job.lor_date_flag || job["lor date flag"] ||
+      job.workflow_output_dammvoyz1 || job.workflow_output_ip1d3eos1 ||
+      job.workflow_output_tmbkyiyod || job.workflow_output_8b8oevxrm || job.lor_date_screening || null,
+  };
+
+  // Only send completeness flags (terse Present/Missing) to LLM for enrichment
+  // Screening flags already have descriptive text from Opus — use them as-is
+  const flagsForLlm = {};
+  for (const [k, v] of Object.entries(rawCompleteness)) {
+    if (v) flagsForLlm[k] = String(v);
+  }
+
+  // Call Azure OpenAI to generate descriptive one-liners
+  const descriptions = await generateFlagDescriptions(flagsForLlm);
+
+  // Build completeness flag objects with LLM descriptions
+  const buildCompleteness = (label, rawValue) => {
+    const desc = descriptions[label] || null;
+    return toCompletenessFlagObj(desc, rawValue);
+  };
+
+  // Build screening flag objects — use actual Opus result text (no LLM rewrite)
+  const buildScreening = (label, rawResultValue, flagColorValue) => {
+    return toScreeningFlagObj(rawResultValue, flagColorValue);
+  };
+
   return {
     thread_id: String(job.jobId),
+    student_id: String(job.studentId || ""),
     execution_time: formatExecutionTime(job.screeningStartedAt, job.screeningCompletedAt),
-    decision: resolveDecision(job),
+    decision: merged.merged_final_decision || resolveDecision(job),
     flagged_or_verified:
+      merged.merged_flagged_or_verified ||
       job.workflow_output_xrxx2p2el || job.workflow_output_39yf6sxsk ||
       job.workflow_output_3snxpv1l4 || job.workflow_output_izvdziwj0 ||
       job.workflow_output_akfo7j55t || "Flagged",
-    case_status: resolveCaseStatus(job),
+    case_status: merged.merged_case_status || resolveCaseStatus(job),
     completeness_flags: {
-      "ID and Personal Details": toCompletenessFlagObj(
-        null,
-        job.id_proof_check || job.workflow_output_s3t4r9a5d || job.workflow_output_4f6zv6ezv || job.workflow_output_9sd0a6s0c
-      ),
-      "Gradesheets and Certificates": toCompletenessFlagObj(
-        null,
-        job.grade_sheets_check || job.workflow_output_pook82hn8 || job.workflow_output_hqo6skenu
-      ),
-      "LOR Documents": toCompletenessFlagObj(
-        null,
-        job.lor_check || job.workflow_output_9eyscad0a || job.workflow_output_wppc352e4
-      ),
-      "Supplemental Documents": toCompletenessFlagObj(
-        null,
-        job.work_experience_check || job.workflow_output_r6ieynkdw || job.workflow_output_ohi0ujbcx
-      ),
+      "ID and Personal Details": buildCompleteness("ID and Personal Details", rawCompleteness["ID and Personal Details"]),
+      "Signature Check": buildCompleteness("Signature Check", rawCompleteness["Signature Check"]),
+      "Gradesheets and Certificates": buildCompleteness("Gradesheets and Certificates", rawCompleteness["Gradesheets and Certificates"]),
+      "LOR Documents": buildCompleteness("LOR Documents", rawCompleteness["LOR Documents"]),
+      "Work Experience Documents": buildCompleteness("Work Experience Documents", rawCompleteness["Work Experience Documents"]),
     },
     screening_flags: {
-      "GPA Rule": toScreeningFlagObj(
-        job.workflow_output_cd4rwg8jc || job.workflow_output_0grmdqhhh || job.workflow_output_19ta2ozzp || job.workflow_output_zoi9kbovp || job.workflow_output_023wrk0az,
-        job.workflow_output_f5gjak4tz || job.workflow_output_86j1k78bn || job.gpa_screening
+      "GPA Result": buildScreening(
+        "GPA Result",
+        rawScreening["GPA Result"],
+        rawScreeningFlags["GPA Result"]
       ),
-      "Work Experience Rule": toScreeningFlagObj(
-        job.workflow_output_ga0k4n971 || job.workflow_output_ye44rvws7 || job.workflow_output_xxtwwawgq || job.workflow_output_z9kai3q6o,
-        job.workflow_output_5zqm4lvlm || job.workflow_output_l0stk8r0x || job.work_exp_screening
+      "Work Experience Result": buildScreening(
+        "Work Experience Result",
+        rawScreening["Work Experience Result"],
+        rawScreeningFlags["Work Experience Result"]
       ),
-      "LOR Institution Rule": toScreeningFlagObj(
-        job.workflow_output_lw6wqc2qi || job.workflow_output_yk6si123w || job.workflow_output_5ixpqswvn || job.workflow_output_cvrqcxwzu,
-        job.workflow_output_6tl5iyh7f || job.workflow_output_h9gink23g || job.lor_university_screening
+      "LOR University Result": buildScreening(
+        "LOR University Result",
+        rawScreening["LOR University Result"],
+        rawScreeningFlags["LOR University Result"]
       ),
-      "LOR Recency Rule": toScreeningFlagObj(
-        job.workflow_output_05bbe8fsy || job.workflow_output_fvnjvkgal || job.workflow_output_dammvoyz1 || job.workflow_output_pexqqlsbt,
-        job.workflow_output_tmbkyiyod || job.workflow_output_8b8oevxrm || job.lor_date_screening
+      "LOR Date Result": buildScreening(
+        "LOR Date Result",
+        rawScreening["LOR Date Result"],
+        rawScreeningFlags["LOR Date Result"]
       ),
     },
     deficiency_list: deficiencyList,
-    reason: deficiencyList.join("; ") || "No deficiencies.",
+    reason: merged.merged_final_reason || deficiencyList.join("; ") || "No deficiencies.",
     available_actions: ["approve", "reject", "waitlist", "raise_insufficiency"],
   };
 };
@@ -647,11 +869,13 @@ const toHumanDecisionResult = (decisionAction, existingJob = {}) => {
 
 const findLatestJobByStudentId = (studentId) => {
   const jobs = getAllJobs();
-  const matches = jobs
-    .filter((job) => String(job.studentId) === String(studentId))
-    .sort((a, b) => Number(b.jobId) - Number(a.jobId));
-
-  return matches[0] || null;
+  // Jobs are appended chronologically; iterate backwards to find the latest match
+  for (let i = jobs.length - 1; i >= 0; i--) {
+    if (String(jobs[i].studentId) === String(studentId)) {
+      return jobs[i];
+    }
+  }
+  return null;
 };
 
 const waitForJobCompletion = async (jobExecutionId) => {
@@ -671,11 +895,12 @@ const waitForJobCompletion = async (jobExecutionId) => {
         const workflowData = await getWorkflowSchema(WORKFLOW_ID_PRIMARY);
         const auditResult = extractResultsFromAudit(audit, workflowData);
         // Merge: audit fills in keys not already in keyedResult
-        return { status, result: { ...auditResult, ...keyedResult } };
+        const combined = { ...auditResult, ...keyedResult };
+        return { status, result: { ...combined, ...mergeWorkflowOutputs(combined) } };
       } catch {
         // Audit fetch failed, use keyed result only
       }
-      return { status, result: keyedResult };
+      return { status, result: { ...keyedResult, ...mergeWorkflowOutputs(keyedResult) } };
     }
 
     if (["FAILED", "CANCELLED"].includes(status)) {
@@ -689,7 +914,7 @@ const waitForJobCompletion = async (jobExecutionId) => {
           (k) => k.startsWith("workflow_output_") || k === "decision" || k === "case_status"
         );
         if (hasRealOutputs) {
-          return { status: "COMPLETED", result: partialResult };
+          return { status: "COMPLETED", result: { ...partialResult, ...mergeWorkflowOutputs(partialResult) } };
         }
       } catch {
         // Audit retrieval failed, fall through to error
@@ -774,7 +999,8 @@ const enrichCompletedJobFromAudit = async (job) => {
     const workflowData = await getWorkflowSchema(WORKFLOW_ID_PRIMARY);
     const auditResult = extractResultsFromAudit(audit, workflowData);
     if (Object.keys(auditResult).length > 0) {
-      const updated = updateJobResult(jobId, auditResult);
+      const merged = mergeWorkflowOutputs(auditResult);
+      const updated = updateJobResult(jobId, { ...auditResult, ...merged });
       return updated;
     }
   } catch (err) {
@@ -872,11 +1098,13 @@ const runPrimaryWorkflowForStudent = async (studentId) => {
 export const getInboxController = async (_req, res) => {
   try {
     ensureSeedDataFromExcel();
-    const jobs = getAllJobs().sort((a, b) => Number(b.jobId) - Number(a.jobId));
+    const jobs = getAllJobs();
     const seenStudentIds = new Set();
     const uniqueByStudent = [];
 
-    for (const job of jobs) {
+    // Iterate backwards so the latest job per student is picked first
+    for (let i = jobs.length - 1; i >= 0; i--) {
+      const job = jobs[i];
       const studentId = String(job.studentId || "").trim();
       if (!studentId || seenStudentIds.has(studentId)) {
         continue;
@@ -917,7 +1145,7 @@ export const triggerScreeningController = async (req, res) => {
 
     const runPromise = (async () => {
       const updatedJob = await runPrimaryWorkflowForStudent(studentId);
-      return toScreeningResult(updatedJob);
+      return await toScreeningResult(updatedJob);
     })();
 
     activeScreeningByStudent.set(studentId, runPromise);
@@ -966,6 +1194,7 @@ export const submitHumanDecisionController = async (req, res) => {
 export const resetJobsController = async (_req, res) => {
   try {
     fs.writeFileSync(jobsFilePath, "[]\n");
+    invalidateJobsCache();
     return res.status(200).json({ message: "Jobs reset successful" });
   } catch (error) {
     return res.status(500).json({ detail: error.message || "Reset failed" });
