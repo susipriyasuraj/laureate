@@ -260,7 +260,8 @@ export default function InboxPage() {
                       >
                         {(() => {
                           const as = c.application_status?.toLowerCase() || '';
-                          const isDone = ['process', 'selected', 'rejected', 'waitlisted', 'incomplete application'].includes(as);
+                          const ss = c.screening_status?.toLowerCase() || '';
+                          const isDone = ss === 'completed' || ['process', 'selected', 'rejected', 'waitlisted', 'incomplete application'].includes(as);
                           return isDone ? (
                             <button
                               onClick={() => navigate(`/case/${c.student_id}`, { state: { mode: 'view', attachment_url: c.attachment_url } })}

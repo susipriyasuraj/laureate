@@ -401,7 +401,7 @@ const mergeWorkflowOutputs = (raw) => {
   const fieldMappings = [
     // [normalised key,            new-case keys (space + underscore),        update-case key]
     ["final_decision",             ["decision"],                                                    "decision_up"],
-    ["case_status",                ["Case Status", "case_status"],                                  "case_status_up"],
+    ["case_status",                ["Case Status"],                                                "case_status_up"],
     ["application_status",         ["application_status"],                                          "application_status_up"],
     ["flagged_or_verified",        ["flagged/verified", "flagged_or_verified"],                     "flagged_verified_up"],
     ["final_reason",               ["decision of agent", "final_reason", "screening_decision"],     "final_reason_up"],
@@ -503,13 +503,14 @@ const toCompletenessFlagObj = (detailText, checkValue) => {
 };
 
 const resolveCaseStatus = (job = {}) => {
-  return (
-    job.merged_case_status ||
-    job.case_status ||
-    job.workflow_output_k47bmhmub ||
-    job.workflow_output_010zbd01n ||
-    (job.status === "COMPLETED" ? "Closed" : "Open")
-  );
+  // Derive case_status from the resolved application status:
+  // "Closed" when the decision is final (Selected / Rejected / Deny), "Open" otherwise.
+  const decision = resolveDecision(job);
+  const normalized = (decision || "").trim().toLowerCase();
+  if (normalized === "selected" || normalized === "rejected" || normalized === "deny") {
+    return "Closed";
+  }
+  return "Open";
 };
 
 const resolveDecision = (job = {}) => {
@@ -668,6 +669,7 @@ const toInboxCase = (job) => ({
   applicant_name: resolveApplicantName(job),
   request_type: job.request_type || "New",
   case_status: resolveCaseStatus(job),
+  screening_status: resolveScreeningStatus(job),
   application_status:
     job.status === "COMPLETED" || job.status === "IN PROGRESS"
       ? resolveDecision(job)
@@ -719,8 +721,6 @@ const toScreeningResult = async (job) => {
   const rawCompleteness = {
     "ID and Personal Details":
       merged.merged_id_proof_check || job.id_proof_check || job["id proof and personal details check"] || job.workflow_output_s3t4r9a5d || job.workflow_output_4f6zv6ezv || job.workflow_output_9sd0a6s0c || null,
-    "Signature Check":
-      merged.merged_signature_check || job.signature_check || job["signature check"] || job.signature_check_result || null,
     "Gradesheets and Certificates":
       merged.merged_grade_sheets_check || job.grade_sheets_check || job["grade sheets check"] || job.workflow_output_pook82hn8 || job.workflow_output_hqo6skenu || null,
     "LOR Documents":
@@ -800,10 +800,9 @@ const toScreeningResult = async (job) => {
       job.workflow_output_xrxx2p2el || job.workflow_output_39yf6sxsk ||
       job.workflow_output_3snxpv1l4 || job.workflow_output_izvdziwj0 ||
       job.workflow_output_akfo7j55t || "Flagged",
-    case_status: merged.merged_case_status || resolveCaseStatus(job),
+    case_status: resolveCaseStatus(job),
     completeness_flags: {
       "ID and Personal Details": buildCompleteness("ID and Personal Details", rawCompleteness["ID and Personal Details"]),
-      "Signature Check": buildCompleteness("Signature Check", rawCompleteness["Signature Check"]),
       "Gradesheets and Certificates": buildCompleteness("Gradesheets and Certificates", rawCompleteness["Gradesheets and Certificates"]),
       "LOR Documents": buildCompleteness("LOR Documents", rawCompleteness["LOR Documents"]),
       "Work Experience Documents": buildCompleteness("Work Experience Documents", rawCompleteness["Work Experience Documents"]),
@@ -881,26 +880,36 @@ const findLatestJobByStudentId = (studentId) => {
 const waitForJobCompletion = async (jobExecutionId) => {
   const maxAttempts = 120;
   const intervalMs = 5000;
+  const resultRetries = 5;
+  const resultRetryDelayMs = 3000;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const statusPayload = await getJobStatus(jobExecutionId);
     const status = statusPayload?.status;
 
     if (status === "COMPLETED") {
-      const resultPayload = await getJobResult(jobExecutionId);
-      const keyedResult = toKeyedResult(resultPayload);
-      // Always try to merge audit results to capture all workflow outputs
-      try {
-        const audit = await getJobAudit(jobExecutionId);
-        const workflowData = await getWorkflowSchema(WORKFLOW_ID_PRIMARY);
-        const auditResult = extractResultsFromAudit(audit, workflowData);
-        // Merge: audit fills in keys not already in keyedResult
-        const combined = { ...auditResult, ...keyedResult };
-        return { status, result: { ...combined, ...mergeWorkflowOutputs(combined) } };
-      } catch {
-        // Audit fetch failed, use keyed result only
+      // Retry result/audit fetching a few times — Opus may report COMPLETED
+      // before all output nodes have propagated their results.
+      for (let r = 0; r < resultRetries; r += 1) {
+        const resultPayload = await getJobResult(jobExecutionId);
+        const keyedResult = toKeyedResult(resultPayload);
+        let combined = { ...keyedResult };
+        try {
+          const audit = await getJobAudit(jobExecutionId);
+          const workflowData = await getWorkflowSchema(WORKFLOW_ID_PRIMARY);
+          const auditResult = extractResultsFromAudit(audit, workflowData);
+          combined = { ...auditResult, ...keyedResult };
+        } catch {
+          // Audit fetch failed, use keyed result only
+        }
+        const hasRealOutputs = Object.keys(combined).some(
+          (k) => k.startsWith("workflow_output_") && !k.includes("input")
+        );
+        if (hasRealOutputs || r === resultRetries - 1) {
+          return { status, result: { ...combined, ...mergeWorkflowOutputs(combined) } };
+        }
+        await sleep(resultRetryDelayMs);
       }
-      return { status, result: { ...keyedResult, ...mergeWorkflowOutputs(keyedResult) } };
     }
 
     if (["FAILED", "CANCELLED"].includes(status)) {
@@ -995,13 +1004,20 @@ const enrichCompletedJobFromAudit = async (job) => {
     // Skip negative (seed) job IDs
     if (jobId.startsWith("-")) return job;
 
-    const audit = await getJobAudit(jobId);
-    const workflowData = await getWorkflowSchema(WORKFLOW_ID_PRIMARY);
-    const auditResult = extractResultsFromAudit(audit, workflowData);
-    if (Object.keys(auditResult).length > 0) {
-      const merged = mergeWorkflowOutputs(auditResult);
-      const updated = updateJobResult(jobId, { ...auditResult, ...merged });
-      return updated;
+    // Retry a few times — audit data may not be available immediately after completion
+    for (let r = 0; r < 3; r += 1) {
+      const audit = await getJobAudit(jobId);
+      const workflowData = await getWorkflowSchema(WORKFLOW_ID_PRIMARY);
+      const auditResult = extractResultsFromAudit(audit, workflowData);
+      const hasRealOutputs = Object.keys(auditResult).some(
+        (k) => k.startsWith("workflow_output_") && !k.includes("input")
+      );
+      if (hasRealOutputs) {
+        const merged = mergeWorkflowOutputs(auditResult);
+        const updated = updateJobResult(jobId, { ...auditResult, ...merged });
+        return updated;
+      }
+      if (r < 2) await sleep(3000);
     }
   } catch (err) {
     // Audit enrichment failed, return job as-is
@@ -1072,10 +1088,6 @@ const runPrimaryWorkflowForStudent = async (studentId) => {
     request_type: existing.request_type,
     attachments: existing.attachments,
     email: existing.email,
-    decision: existing.decision,
-    final_decision: existing.final_decision,
-    reason: existing.reason,
-    case_status: existing.case_status,
     studentId: String(studentId),
     groupId: existing.groupId || null,
     status: "IN PROGRESS",

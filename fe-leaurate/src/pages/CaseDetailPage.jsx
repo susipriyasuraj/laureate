@@ -347,8 +347,10 @@ export default function CaseDetailPage() {
             {/* Card body */}
             <div className="px-6 py-4">
               <div className="flex flex-wrap gap-2">
-                {(screeningResult || screeningLoading) ? (
+                {screeningLoading ? (
                   <StatusBadge value="Under Review" kind="screening" />
+                ) : screeningResult ? (
+                  <StatusBadge value={screeningResult.decision || screeningResult.case_status || "Under Review"} kind="application" />
                 ) : (
                   <>
                     <StatusBadge value={caseInfo.request_type}       kind="request" />

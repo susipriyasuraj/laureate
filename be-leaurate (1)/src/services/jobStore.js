@@ -94,7 +94,13 @@ export const updateJobResult = (jobId, result) => {
     return newJob;
   }
 
-  jobs[job] = {...jobs[job], ...result};
+  // Preserve request_type from the original record; it should only change via Excel re-import.
+  const existing = jobs[job];
+  const merged = { ...existing, ...result };
+  if (existing.request_type !== undefined) {
+    merged.request_type = existing.request_type;
+  }
+  jobs[job] = merged;
   writeJobs(jobs);
 
   return jobs[job];
